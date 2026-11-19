@@ -169,8 +169,10 @@ Estimate the reference-distribution biases from `NBsampl` random configurations.
 """
 function compute_bias(W::CuMatrix{Float32}, NBsampl::Int)
     Nv, Nh = size(W) .- 1
-    J = W[2:end, 2:end]   # physical block only, no bias row/col
-
+    J = W[2:end, 2:end]      # physical block only, no bias row/col
+    b = W[2:end, 1]          # visible bias   (Nv)
+    c = W[1, 2:end]          # hidden bias    (Nh)
+    
     # Random {0,1} or {-1,+1} configurations (physical units only)
     spin_lo = Float32(-Binary)   # -1 (Ising) or 0 (binary)
     h_rand = CUDA.rand(Float32, Nh, NBsampl) .< 0.5f0
@@ -179,8 +181,8 @@ function compute_bias(W::CuMatrix{Float32}, NBsampl::Int)
     v_rand = Float32.(v_rand) .* (1f0 - spin_lo) .+ spin_lo
 
     # Mean activation:  ξ_v = < (sign(J h) + 1) / 2 >_h,  and vice versa
-    field_v = J  * h_rand    # Nv × NBsampl
-    field_h = J' * v_rand    # Nh × NBsampl
+    field_v = J  * h_rand .+ b   # Nv × NBsampl
+    field_h = J' * v_rand .+ c   # Nh × NBsampl
     ξv = vec(mean((-sign.(field_v) .+ 1f0) ./ 2f0, dims=2))   # ∈ [0,1]
     ξh = vec(mean((-sign.(field_h) .+ 1f0) ./ 2f0, dims=2))   # ∈ [0,1]
 
