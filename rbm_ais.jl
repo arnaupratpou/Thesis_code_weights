@@ -42,6 +42,8 @@ const trans    = false        # If we want to transpose the matrix or not
 const vis_only = false        # Keep only the visible array or keep the hole v-h space
 const lnZ_vis  = false        # Integrate the hidden part when calculating the partition function
 const overlap_method = "all"  # If we calculate the overlap by summing all pairs or just disjoint pairs
+const Bias_per_sample = true  # true  → each AIS sample gets its own B (and C), from its own NBsampl configurations
+                              # false → one (B, C) per simulation, shared by all NAsampl samples
 
 
 const Bias_method = "Sgh"     # "Sgh" | "Sgh_x" | "Sgh_h" | "PInv" | "B0"
@@ -247,9 +249,16 @@ end
 
 Build the full (Nv+1)×NAsampl and (Nh+1)×NAsampl bias matrices according to
 the chosen method.  Only "Sgh" variants call `compute_bias`.
+
+For the "Sgh" variants, `per_sample` selects whether every one of the `NAsampl`
+columns gets its own bias, each estimated from its own `NBsampl` random
+configurations (`true`), or whether a single bias is estimated once and copied
+to all columns (`false`).  "PInv" and "B0" are deterministic, so `per_sample`
+has no effect on them.
 """
 function make_bias_matrices(W::CuMatrix{Float32}, method::String,
-                             NBsampl::Int, NAsampl::Int)
+                             NBsampl::Int, NAsampl::Int;
+                             per_sample::Bool = Bias_per_sample)
     Nv, Nh = size(W) .- 1
 
     if method == "B0"
@@ -257,17 +266,19 @@ function make_bias_matrices(W::CuMatrix{Float32}, method::String,
         C = CUDA.zeros(Float32, Nh+1, NAsampl)
 
     elseif method ∈ ("Sgh", "Sgh_x", "Sgh_h")
-        # Compute bias NAsampl times from NBsampl random configurations.
-        B = CUDA.zeros(Float32, Nv+1, NAsampl)
-        C = CUDA.zeros(Float32, Nh+1, NAsampl)
-        # Assuming different bias for each independent sample.
-        # If you want to use the same bias for all samples, comment the next 3 lines and uncomment the following 3 lines
-        for ii = 1:NAsampl
-            B[:, ii], C[:, ii] = compute_bias(W, NBsampl)
+        if per_sample
+            # One bias per AIS sample, each from its own NBsampl random configurations.
+            B = CUDA.zeros(Float32, Nv+1, NAsampl)
+            C = CUDA.zeros(Float32, Nh+1, NAsampl)
+            for ii = 1:NAsampl
+                B[:, ii], C[:, ii] = compute_bias(W, NBsampl)
+            end
+        else
+            # A single bias, estimated once and shared by all NAsampl samples.
+            b_col, c_col = compute_bias(W, NBsampl)
+            B = repeat(b_col, 1, NAsampl)
+            C = repeat(c_col, 1, NAsampl)
         end
-        # b_col, c_col = compute_bias(W, NBsampl)
-        # B = repeat(b_col, 1, NAsampl)
-        # C = repeat(c_col, 1, NAsampl)
         if method == "Sgh_x"  C .= 0f0  end
         if method == "Sgh_h"  B .= 0f0  end
 
@@ -563,7 +574,7 @@ end
 
 for ii = 1:NSim
     println("## AIS — RBM thermodynamics")
-    println("# Nβ=$(Nβ)  NAsampl=$(NAsampl)  NBsampl=$(NBsampl)  method=$(Bias_method)")
+    println("# Nβ=$(Nβ)  NAsampl=$(NAsampl)  NBsampl=$(NBsampl)  method=$(Bias_method) bias_per_sample=$(Bias_per_sample)")
     flush(stdout)
 
     if WEIGHTS_FILE == "Ising2D"
