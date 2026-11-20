@@ -31,7 +31,7 @@ const NSim    = 1             # Total number of independent simulations
 
 const j = 1.f0                # Ising interaction
 const L = 12                  # Ising lattice size
-const p = 0.5                 # EA probability of setting a positive interaction
+const p = 0.5                 # EA fraction of interactions set to negative (p = 0.5 → symmetric ±J)
 
 const σ = 1.f0                # SK std
 const μ = 0                   # SK mean
@@ -44,6 +44,9 @@ const lnZ_vis  = false        # Integrate the hidden part when calculating the p
 const overlap_method = "all"  # If we calculate the overlap by summing all pairs or just disjoint pairs
 const Bias_per_sample = true  # true  → each AIS sample gets its own B (and C), from its own NBsampl configurations
                               # false → one (B, C) per simulation, shared by all NAsampl samples
+                              # WARNING: true is much slower. It calls `compute_bias` NAsampl times per temperature,
+                              # each call with CPU↔GPU copies, and can become the bottleneck of the run.
+                              # false gives a considerable speed-up (only affects the "Sgh" variants).
 
 
 const Bias_method = "Sgh"     # "Sgh" | "Sgh_x" | "Sgh_h" | "PInv" | "B0"
@@ -211,22 +214,44 @@ end
 """
     compute_bias_pinv(W) → (B, C)
 
-Pseudoinverse-based bias: solve  J h = b  and  Jᵀ v = c  for the ground-state
-configuration, then convert to logistic biases.
+Pseudoinverse-based bias.  We look for the state of the complete (v, h) space
+with large probability by setting to zero the gradient of the energy:
 
-Correction vs original: `pinv(J') * c`, not `pinv(J)' * c`.
+    ∇_h E = 0  →  Jᵀ v = -c   →   v_p = -(J⁺)ᵀ c = -pinv(J') * c
+    ∇_v E = 0  →  J  h = -b   →   h_p = -J⁺ b     = -pinv(J)  * b
+
+Each component of v_p (h_p) is then rounded to the closest allowed value
+({0,1} or {-1,+1}) and used as the estimate of ⟨v⟩ (⟨h⟩), from which the
+mean-field bias is built exactly as in `compute_bias`.
 """
 function compute_bias_pinv(W::CuMatrix{Float32})
     J = Array(W[2:end, 2:end])
     b = Array(W[2:end, 1])
     c = Array(W[1, 2:end])
 
-    ξh = pinv(J)  * b      # solve  J  h = b
-    ξv = pinv(J') * c      # solve  Jᵀ v = c   (corrected from pinv(J)')
+    vp = -(pinv(J') * c)      # solve  Jᵀ v = -c  (minimum-norm least squares)
+    hp = -(pinv(J)  * b)      # solve  J  h = -b
 
-    clamp!(ξv, 0f0, 1f0 - eps(Float32))
-    clamp!(ξh, 0f0, 1f0 - eps(Float32))
+    # Round to the closest allowed value
+    if Binary == 0
+        vp = Float32.(vp .> 0.5f0)                 # {0,1}
+        hp = Float32.(hp .> 0.5f0)
+    else
+        vp = ifelse.(vp .>= 0f0, 1f0, -1f0)        # {-1,+1}
+        hp = ifelse.(hp .>= 0f0, 1f0, -1f0)
+    end
 
+    # ξ = probability that the unit is off ({0,1}) or equal to -1 ({-1,+1}),
+    # the same convention as in `compute_bias`
+    if Binary == 0
+        ξv = 1f0 .- vp
+        ξh = 1f0 .- hp
+    else
+        ξv = (1f0 .- vp) ./ 2f0
+        ξh = (1f0 .- hp) ./ 2f0
+    end
+
+    # Shrink away from 0 and 1 to avoid log(0) / log(∞)
     ξv .= ξv .+ 0.05f0 .- 0.1f0 .* ξv
     ξh .= ξh .+ 0.05f0 .- 0.1f0 .* ξh
 
@@ -234,8 +259,8 @@ function compute_bias_pinv(W::CuMatrix{Float32})
         B_phys = log.(1f0 ./ ξv .- 1f0)
         C_phys = log.(1f0 ./ ξh .- 1f0)
     else
-        B_phys = atanh.(2f0 .* ξv .- 1f0)
-        C_phys = atanh.(2f0 .* ξh .- 1f0)
+        B_phys = atanh.(1f0 .- 2f0 .* ξv)
+        C_phys = atanh.(1f0 .- 2f0 .* ξh)
     end
 
     B = CuArray([0f0; Float32.(B_phys)])
@@ -571,6 +596,11 @@ end
 # ==============================================================================
 #  MAIN LOOP
 # ==============================================================================
+
+# The spin-system generators are meant for {-1,+1} units (Binary = 1)
+if Binary == 0 && WEIGHTS_FILE ∈ ("Ising2D", "Ising3D", "EA3D", "BSK")
+    @warn "WEIGHTS_FILE=\"$(WEIGHTS_FILE)\" describes a spin system, intended for {-1,+1} units (Binary = 1), but Binary = 0 ({0,1} units) is set. The run will continue with {0,1} units."
+end
 
 for ii = 1:NSim
     println("## AIS — RBM thermodynamics")
